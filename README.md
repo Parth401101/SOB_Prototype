@@ -11,3 +11,11 @@ i have ran for 10000 nodes
 but i messed up a little bit  in the mining application as you can see the network only mined only 7 blocks 
 
 ![image](https://github.com/user-attachments/assets/3d2b0a0c-6c98-454d-a377-cdf2bf4ffeca)
+
+after fixing the mining application 
+i have ran the simualtion for 1000 nodes where a block is minined every 10secs 
+![image](https://github.com/user-attachments/assets/b38efcf1-0ac8-4c4a-b9c1-57975857357c)
+
+i will run the simualtion for 10k nodes very sooon 
+I know the prototype is not complete in terms of network but will make it better
+
