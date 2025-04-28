@@ -16,626 +16,566 @@
 using namespace ns3;
 
 NS_LOG_COMPONENT_DEFINE("TcpGossip");
-
-// Hash function for messages to reduce memory usage
-class MessageHasher {
-public:
-    static uint64_t HashString(const std::string& msg) {
-        std::hash<std::string> hasher;
-        return hasher(msg);
-    }
-};
-
 class TcpGossipApp : public Application {
-private:
-    Ptr<Socket> m_socket;
-    std::vector<Ipv6Address> m_neighbors;
-
-    // Connection pool implementation
-    class ConnectionPool {
     private:
-        // Only create a fixed number of outgoing connections at a time
-        static const uint32_t MAX_ACTIVE_CONNECTIONS = 10;
-        
-        // Map to track persistent connections to neighbors
-        std::map<Ipv6Address, Ptr<Socket>> m_neighborSockets;
-        // Track if a socket is considered active
-        std::map<Ipv6Address, bool> m_socketActive;
-        // Track connection priority (lower = higher priority)
-        std::map<Ipv6Address, uint32_t> m_connectionPriority;
-        // Weak references to incoming sockets
-        std::unordered_set<Ptr<Socket>> m_incomingSockets;
-        
-        // Last time we exchanged data with this neighbor
-        std::map<Ipv6Address, double> m_lastActivity;
-        
-        // Reference to parent app
-        TcpGossipApp* m_app;
-        
-    public:
-        ConnectionPool(TcpGossipApp* app) : m_app(app) {}
-        
-        void AddNeighbor(Ipv6Address neighbor) {
-            if (m_neighborSockets.find(neighbor) == m_neighborSockets.end()) {
-                m_neighborSockets[neighbor] = nullptr;
-                m_socketActive[neighbor] = false;
-                m_connectionPriority[neighbor] = rand() % 100; // Random initial priority
-                m_lastActivity[neighbor] = 0.0;
-            }
-        }
-        
-        void RemoveNeighbor(Ipv6Address neighbor) {
-            auto socketIt = m_neighborSockets.find(neighbor);
-            if (socketIt != m_neighborSockets.end()) {
-                if (socketIt->second) {
-                    socketIt->second->Close();
-                }
-                m_neighborSockets.erase(socketIt);
-            }
-            m_socketActive.erase(neighbor);
-            m_connectionPriority.erase(neighbor);
-            m_lastActivity.erase(neighbor);
-        }
-        
-        void AddIncomingSocket(Ptr<Socket> socket) {
-            m_incomingSockets.insert(socket);
-        }
-        
-        void RemoveIncomingSocket(Ptr<Socket> socket) {
-            m_incomingSockets.erase(socket);
-        }
-        
-        void UpdateActivity(Ipv6Address neighbor) {
-            // Update last activity time
-            m_lastActivity[neighbor] = Simulator::Now().GetSeconds();
-            
-            // Increase priority (lower number = higher priority)
-            m_connectionPriority[neighbor] = m_connectionPriority[neighbor] / 2;
-        }
-        
-        void UpdateActivityFromSocket(Ptr<Socket> socket) {
-            // Find which neighbor this socket belongs to
-            for (auto& pair : m_neighborSockets) {
-                if (pair.second == socket) {
-                    UpdateActivity(pair.first);
-                    break;
-                }
-            }
-        }
-        
-        void SetSocket(Ipv6Address neighbor, Ptr<Socket> socket) {
-            m_neighborSockets[neighbor] = socket;
-        }
-        
-        void SetSocketActive(Ipv6Address neighbor, bool active) {
-            m_socketActive[neighbor] = active;
-        }
-        
-        bool IsActive(Ipv6Address neighbor) const {
-            auto it = m_socketActive.find(neighbor);
-            return (it != m_socketActive.end() && it->second);
-        }
-        
-        Ptr<Socket> GetSocket(Ipv6Address neighbor) {
-            auto it = m_neighborSockets.find(neighbor);
-            return (it != m_neighborSockets.end()) ? it->second : nullptr;
-        }
-        
-        uint32_t GetActiveConnectionCount() const {
-            uint32_t count = 0;
-            for (const auto& pair : m_socketActive) {
-                if (pair.second) count++;
-            }
-            return count;
-        }
-        
-        // Get neighbors ordered by priority
-        std::vector<Ipv6Address> GetPriorityNeighbors() {
-            std::vector<std::pair<Ipv6Address, uint32_t>> neighbors;
-            
-            for (const auto& pair : m_connectionPriority) {
-                neighbors.push_back(std::make_pair(pair.first, pair.second));
-            }
-            
-            // Sort by priority (lower number = higher priority)
-            std::sort(neighbors.begin(), neighbors.end(), 
-                    [](const auto& a, const auto& b) {
-                        return a.second < b.second;
-                    });
-            
-            std::vector<Ipv6Address> result;
-            for (const auto& pair : neighbors) {
-                result.push_back(pair.first);
-            }
-            
-            return result;
-        }
-        
-        void ManageConnections() {
-            // Check if we need to establish more connections
-            uint32_t activeConnections = GetActiveConnectionCount();
-            
-            if (activeConnections < MAX_ACTIVE_CONNECTIONS && m_neighborSockets.size() > 0) {
-                // Get neighbors sorted by priority
-                std::vector<Ipv6Address> priorityNeighbors = GetPriorityNeighbors();
-                
-                // Try to establish connections to high-priority neighbors first
-                for (const auto& neighbor : priorityNeighbors) {
-                    if (activeConnections >= MAX_ACTIVE_CONNECTIONS) break;
-                    
-                    if (!IsActive(neighbor)) {
-                        // Schedule connection with a small delay
-                        Simulator::Schedule(MilliSeconds(rand() % 100), 
-                                          &TcpGossipApp::ConnectToNeighbor, 
-                                          m_app, neighbor);
-                        
-                        activeConnections++;
-                    }
-                }
-            }
-            
-            // If we have too many connections, close the least important ones
-            if (activeConnections > MAX_ACTIVE_CONNECTIONS) {
-                // Get neighbors in reverse priority order
-                std::vector<Ipv6Address> priorityNeighbors = GetPriorityNeighbors();
-                std::reverse(priorityNeighbors.begin(), priorityNeighbors.end());
-                
-                for (const auto& neighbor : priorityNeighbors) {
-                    if (activeConnections <= MAX_ACTIVE_CONNECTIONS) break;
-                    
-                    if (IsActive(neighbor)) {
-                        auto socket = GetSocket(neighbor);
-                        if (socket) {
-                            socket->Close();
-                            SetSocket(neighbor, nullptr);
-                        }
-                        SetSocketActive(neighbor, false);
-                        activeConnections--;
-                    }
-                }
-            }
-        }
-        
-        void CloseAllConnections() {
-            for (auto& socketPair : m_neighborSockets) {
-                if (socketPair.second) {
-                    socketPair.second->Close();
-                }
-            }
-            m_neighborSockets.clear();
-            m_socketActive.clear();
-            
-            for (auto& socket : m_incomingSockets) {
-                socket->Close();
-            }
-            m_incomingSockets.clear();
-        }
-    };
+        Ptr<Socket> m_socket;
+        std::vector<Ipv6Address> m_neighbors;
     
-    // Message manager with bloom filter to reduce memory usage
-    class MessageManager {
-    private:
-        // Simple bloom filter implementation
-        class BloomFilter {
+        // Connection pool implementation
+        class ConnectionPool {
         private:
-            std::vector<bool> m_bits;
-            size_t m_size;
-            uint32_t m_numHashes;
+            // max active connections
+            static const uint32_t MAX_ACTIVE_CONNECTIONS = 10;
             
-            // Hash function
-            size_t hash(const uint64_t key, uint32_t seed) const {
-                uint64_t h = key + seed;
-                h ^= h >> 33;
-                h *= 0xff51afd7ed558ccdL;
-                h ^= h >> 33;
-                h *= 0xc4ceb9fe1a85ec53L;
-                h ^= h >> 33;
-                return h % m_size;
-            }
+            // Map to track persistent connections to neighbors
+            std::map<Ipv6Address, Ptr<Socket>> m_neighborSockets;
+            // Track if a socket is considered active
+            std::map<Ipv6Address, bool> m_socketActive;
+            // Track connection priority (lower = higher priority)
+            std::map<Ipv6Address, uint32_t> m_connectionPriority;
+            // Weak references to incoming sockets
+            std::unordered_set<Ptr<Socket>> m_incomingSockets;
+            
+            // Last time we exchanged data with this neighbor
+            std::map<Ipv6Address, double> m_lastActivity;
+            
+            // Reference to parent app
+            TcpGossipApp* m_app;
             
         public:
-            BloomFilter(size_t size = 10000, uint32_t numHashes = 5) 
-                : m_size(size), m_numHashes(numHashes) {
-                m_bits.resize(size, false);
-            }
+            ConnectionPool(TcpGossipApp* app) : m_app(app) {}
             
-            void insert(uint64_t key) {
-                for (uint32_t i = 0; i < m_numHashes; i++) {
-                    size_t pos = hash(key, i);
-                    m_bits[pos] = true;
+            void AddNeighbor(Ipv6Address neighbor) {
+                if (m_neighborSockets.find(neighbor) == m_neighborSockets.end()) {
+                    m_neighborSockets[neighbor] = nullptr;
+                    m_socketActive[neighbor] = false;
+                    m_connectionPriority[neighbor] = rand() % 100; // Random initial priority
+                    m_lastActivity[neighbor] = 0.0;
                 }
             }
             
-            bool contains(uint64_t key) const {
-                for (uint32_t i = 0; i < m_numHashes; i++) {
-                    size_t pos = hash(key, i);
-                    if (!m_bits[pos]) return false;
+            void RemoveNeighbor(Ipv6Address neighbor) {
+                auto socketIt = m_neighborSockets.find(neighbor);
+                if (socketIt != m_neighborSockets.end()) {
+                    if (socketIt->second) {
+                        socketIt->second->Close();
+                    }
+                    m_neighborSockets.erase(socketIt);
                 }
-                return true;
+                m_socketActive.erase(neighbor);
+                m_connectionPriority.erase(neighbor);
+                m_lastActivity.erase(neighbor);
+            }
+            
+            void AddIncomingSocket(Ptr<Socket> socket) {
+                m_incomingSockets.insert(socket);
+            }
+            
+            void RemoveIncomingSocket(Ptr<Socket> socket) {
+                m_incomingSockets.erase(socket);
+            }
+            
+            void UpdateActivity(Ipv6Address neighbor) {
+                // Update last activity time
+                m_lastActivity[neighbor] = Simulator::Now().GetSeconds();
+                
+                // Increase priority (lower number = higher priority)
+                m_connectionPriority[neighbor] = m_connectionPriority[neighbor] / 2;
+            }
+            
+            void UpdateActivityFromSocket(Ptr<Socket> socket) {
+                // Find which neighbor this socket belongs to
+                for (auto& pair : m_neighborSockets) {
+                    if (pair.second == socket) {
+                        UpdateActivity(pair.first);
+                        break;
+                    }
+                }
+            }
+            
+            void SetSocket(Ipv6Address neighbor, Ptr<Socket> socket) {
+                m_neighborSockets[neighbor] = socket;
+            }
+            
+            void SetSocketActive(Ipv6Address neighbor, bool active) {
+                m_socketActive[neighbor] = active;
+            }
+            
+            bool IsActive(Ipv6Address neighbor) const {
+                auto it = m_socketActive.find(neighbor);
+                return (it != m_socketActive.end() && it->second);
+            }
+            
+            Ptr<Socket> GetSocket(Ipv6Address neighbor) {
+                auto it = m_neighborSockets.find(neighbor);
+                return (it != m_neighborSockets.end()) ? it->second : nullptr;
+            }
+            
+            uint32_t GetActiveConnectionCount() const {
+                uint32_t count = 0;
+                for (const auto& pair : m_socketActive) {
+                    if (pair.second) count++;
+                }
+                return count;
+            }
+            
+            // Get neighbors ordered by priority
+            std::vector<Ipv6Address> GetPriorityNeighbors() {
+                std::vector<std::pair<Ipv6Address, uint32_t>> neighbors;
+                
+                for (const auto& pair : m_connectionPriority) {
+                    neighbors.push_back(std::make_pair(pair.first, pair.second));
+                }
+                
+                // Sort by priority (lower number = higher priority)
+                std::sort(neighbors.begin(), neighbors.end(), 
+                        [](const auto& a, const auto& b) {
+                            return a.second < b.second;
+                        });
+                
+                std::vector<Ipv6Address> result;
+                for (const auto& pair : neighbors) {
+                    result.push_back(pair.first);
+                }
+                
+                return result;
+            }
+            
+            void ManageConnections() {
+                // Check if we need to establish more connections
+                uint32_t activeConnections = GetActiveConnectionCount();
+                
+                if (activeConnections < MAX_ACTIVE_CONNECTIONS && m_neighborSockets.size() > 0) {
+                    // Get neighbors sorted by priority
+                    std::vector<Ipv6Address> priorityNeighbors = GetPriorityNeighbors();
+                    
+                    // Try to establish connections to high-priority neighbors first
+                    for (const auto& neighbor : priorityNeighbors) {
+                        if (activeConnections >= MAX_ACTIVE_CONNECTIONS) break;
+                        
+                        if (!IsActive(neighbor)) {
+                            // Schedule connection with a small delay
+                            Simulator::Schedule(MilliSeconds(rand() % 100), 
+                                              &TcpGossipApp::ConnectToNeighbor, 
+                                              m_app, neighbor);
+                            
+                            activeConnections++;
+                        }
+                    }
+                }
+                
+                // If we have too many connections, close the least important ones
+                if (activeConnections > MAX_ACTIVE_CONNECTIONS) {
+                    // Get neighbors in reverse priority order
+                    std::vector<Ipv6Address> priorityNeighbors = GetPriorityNeighbors();
+                    std::reverse(priorityNeighbors.begin(), priorityNeighbors.end());
+                    
+                    for (const auto& neighbor : priorityNeighbors) {
+                        if (activeConnections <= MAX_ACTIVE_CONNECTIONS) break;
+                        
+                        if (IsActive(neighbor)) {
+                            auto socket = GetSocket(neighbor);
+                            if (socket) {
+                                socket->Close();
+                                SetSocket(neighbor, nullptr);
+                            }
+                            SetSocketActive(neighbor, false);
+                            activeConnections--;
+                        }
+                    }
+                }
+            }
+            
+            void CloseAllConnections() {
+                for (auto& socketPair : m_neighborSockets) {
+                    if (socketPair.second) {
+                        socketPair.second->Close();
+                    }
+                }
+                m_neighborSockets.clear();
+                m_socketActive.clear();
+                
+                for (auto& socket : m_incomingSockets) {
+                    socket->Close();
+                }
+                m_incomingSockets.clear();
             }
         };
         
-        BloomFilter m_receivedFilter;     // Bloom filter for received messages
-        BloomFilter m_forwardedFilter;    // Bloom filter for forwarded messages
-        
-        // Backup exact tracking for important messages (blocks)
-        std::unordered_set<uint64_t> m_receivedBlocks;
-        uint32_t m_receivedBlockCount;
-        
-    public:
-        MessageManager() : m_receivedBlockCount(0) {
-            // Use larger bloom filters for large networks
-            m_receivedFilter = BloomFilter(100000, 5);
-            m_forwardedFilter = BloomFilter(100000, 5);
-        }
-        
-        bool IsReceived(const std::string& msg) const {
-            uint64_t hash = MessageHasher::HashString(msg);
-            return m_receivedFilter.contains(hash);
-        }
-        
-        bool IsForwarded(const std::string& msg) const {
-            uint64_t hash = MessageHasher::HashString(msg);
-            return m_forwardedFilter.contains(hash);
-        }
-        
-        void MarkReceived(const std::string& msg) {
-            uint64_t hash = MessageHasher::HashString(msg);
-            m_receivedFilter.insert(hash);
+        // Simplified message manager without bloom filter
+        class MessageManager {
+        private:
+            // Direct tracking of messages using hash sets
+            std::unordered_set<std::string> m_receivedMessages;
+            std::unordered_set<std::string> m_forwardedMessages;
+            uint32_t m_receivedBlockCount;
             
-            // Track blocks separately
-            if (msg.find("Block_") == 0) {
-                m_receivedBlocks.insert(hash);
-                m_receivedBlockCount++;
+        public:
+            MessageManager() : m_receivedBlockCount(0) {}
+            
+            bool IsReceived(const std::string& msg) const {
+                return m_receivedMessages.find(msg) != m_receivedMessages.end();
+            }
+            
+            bool IsForwarded(const std::string& msg) const {
+                return m_forwardedMessages.find(msg) != m_forwardedMessages.end();
+            }
+            
+            void MarkReceived(const std::string& msg) {
+                m_receivedMessages.insert(msg);
+                
+                // Track blocks separately
+                if (msg.find("Block_") == 0) {
+                    m_receivedBlockCount++;
+                }
+            }
+            
+            void MarkForwarded(const std::string& msg) {
+                m_forwardedMessages.insert(msg);
+            }
+            
+            uint32_t GetReceivedBlockCount() const {
+                return m_receivedBlockCount;
+            }
+        };
+        
+        ConnectionPool m_connectionPool;
+        MessageManager m_messageManager;
+        
+        Ipv6Address m_myAddress;
+        uint32_t m_nodeId;
+        bool m_isSender;
+        
+        // For connection management
+        EventId m_connectionCheckEvent;
+        bool m_connectionsEstablished;
+        
+        // For batched message forwarding
+        EventId m_forwardEvent;
+        std::vector<std::string> m_pendingMessages;
+        static const uint32_t MAX_PENDING_MESSAGES = 20;
+        static const Time FORWARD_INTERVAL;
+    
+    public:
+        TcpGossipApp(Ipv6Address myAddress) 
+            : m_myAddress(myAddress), 
+              m_isSender(false),
+              m_connectionsEstablished(false),
+              m_connectionPool(this),
+              m_messageManager() {}
+    
+        void AddNeighbor(Ipv6Address neighbor) {
+            if (neighbor != m_myAddress) {
+                m_neighbors.push_back(neighbor);
+                m_connectionPool.AddNeighbor(neighbor);
+            }
+        }
+    
+        void GetNeighbors(std::vector<Ipv6Address>& neighbors) const {
+            neighbors = m_neighbors;
+        }
+    
+        void RemoveNeighbor(Ipv6Address neighbor) {
+            for (auto it = m_neighbors.begin(); it != m_neighbors.end(); ++it) {
+                if (*it == neighbor) {
+                    m_neighbors.erase(it);
+                    m_connectionPool.RemoveNeighbor(neighbor);
+                    return;
+                }
+            }
+        }
+    
+        void PrintNeighbors() const {
+            std::cout << "Neighbors of " << m_myAddress << " (Node " << m_nodeId << "):" << std::endl;
+            for (const auto& neighbor : m_neighbors) {
+                std::cout << "  " << neighbor << std::endl;
             }
         }
         
-        void MarkForwarded(const std::string& msg) {
-            uint64_t hash = MessageHasher::HashString(msg);
-            m_forwardedFilter.insert(hash);
+        void StartApplication() override {
+            m_nodeId = GetNode()->GetId();
+            
+            // Only print neighbors for a small subset of nodes
+            if (m_nodeId % 50 == 0) {
+                PrintNeighbors();
+            }
+            
+            // Create listening socket
+            m_socket = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
+            m_socket->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 8080));
+            m_socket->Listen();
+    
+            m_socket->SetAcceptCallback(
+                MakeCallback(&TcpGossipApp::AcceptConnection, this),
+                MakeCallback(&TcpGossipApp::HandleAccept, this)
+            );
+            
+            // Schedule connection establishment with delay based on node ID
+            // This staggers connection attempts to prevent network flood
+            Time delay = MilliSeconds(100 + (m_nodeId % 1000));
+            Simulator::Schedule(delay, &TcpGossipApp::EstablishConnections, this);
+            
+            // Schedule periodic connection check with staggered timing
+            m_connectionCheckEvent = Simulator::Schedule(
+                Seconds(2.0 + (double)(m_nodeId % 100) / 100.0), 
+                &TcpGossipApp::CheckConnections, this);
         }
         
-        uint32_t GetReceivedBlockCount() const {
-            return m_receivedBlockCount;
+        void StopApplication() override {
+            // Cancel scheduled events
+            if (m_connectionCheckEvent.IsRunning()) {
+                Simulator::Cancel(m_connectionCheckEvent);
+            }
+            
+            if (m_forwardEvent.IsRunning()) {
+                Simulator::Cancel(m_forwardEvent);
+            }
+            
+            // Close all connections
+            m_connectionPool.CloseAllConnections();
+            
+            // Close listening socket
+            if (m_socket) {
+                m_socket->Close();
+                m_socket = nullptr;
+            }
         }
-    };
-    
-    ConnectionPool m_connectionPool;
-    MessageManager m_messageManager;
-    
-    Ipv6Address m_myAddress;
-    uint32_t m_nodeId;
-    bool m_isSender;
-    
-    // For connection management
-    EventId m_connectionCheckEvent;
-    bool m_connectionsEstablished;
-    
-    // For batched message forwarding
-    EventId m_forwardEvent;
-    std::vector<std::string> m_pendingMessages;
-    static const uint32_t MAX_PENDING_MESSAGES = 20;
-    static const Time FORWARD_INTERVAL;
-
-public:
-    TcpGossipApp(Ipv6Address myAddress) 
-        : m_myAddress(myAddress), 
-          m_isSender(false),
-          m_connectionsEstablished(false),
-          m_connectionPool(this),
-          m_messageManager() {}
-
-    void AddNeighbor(Ipv6Address neighbor) {
-        if (neighbor != m_myAddress) {
-            m_neighbors.push_back(neighbor);
-            m_connectionPool.AddNeighbor(neighbor);
+        
+        void EstablishConnections() {
+            // Let the connection pool manage connections
+            m_connectionPool.ManageConnections();
+            m_connectionsEstablished = true;
         }
-    }
-
-    void GetNeighbors(std::vector<Ipv6Address>& neighbors) const {
-        neighbors = m_neighbors;
-    }
-
-    void RemoveNeighbor(Ipv6Address neighbor) {
-        for (auto it = m_neighbors.begin(); it != m_neighbors.end(); ++it) {
-            if (*it == neighbor) {
-                m_neighbors.erase(it);
-                m_connectionPool.RemoveNeighbor(neighbor);
+        
+        void ConnectToNeighbor(Ipv6Address neighborAddr) {
+            // Create a new socket for this neighbor
+            Ptr<Socket> socket = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
+            
+            socket->SetConnectCallback(
+                MakeCallback(&TcpGossipApp::ConnectionSucceeded, this),
+                MakeCallback(&TcpGossipApp::ConnectionFailed, this)
+            );
+            
+            socket->SetRecvCallback(MakeCallback(&TcpGossipApp::ReceiveMessage, this));
+            
+            // Add this socket to our tracking
+            m_connectionPool.SetSocket(neighborAddr, socket);
+            m_connectionPool.SetSocketActive(neighborAddr, false); // Not active yet
+            
+            // Try to connect
+            socket->Connect(Inet6SocketAddress(neighborAddr, 8080));
+        }
+        
+        void CheckConnections() {
+            // Manage connections periodically
+            m_connectionPool.ManageConnections();
+            
+            // Schedule next check with a random variation to prevent synchronization
+            double jitter = (double)(rand() % 500) / 1000.0; // 0-0.5s jitter
+            m_connectionCheckEvent = Simulator::Schedule(
+                Seconds(5.0 + jitter), 
+                &TcpGossipApp::CheckConnections, this);
+        }
+        
+        void SendHeartbeat(Ptr<Socket> socket) {
+            // Send a compact heartbeat message
+            std::string heartbeat = "h\n";
+            Ptr<Packet> packet = Create<Packet>((uint8_t*)heartbeat.c_str(), heartbeat.size());
+            socket->Send(packet);
+        }
+    
+        bool AcceptConnection(Ptr<Socket> socket, const Address &from) {
+            return true;  
+        }
+    
+        void HandleAccept(Ptr<Socket> socket, const Address &from) {
+            // Track this incoming socket
+            m_connectionPool.AddIncomingSocket(socket);
+            
+            // Set up receive callback
+            socket->SetRecvCallback(MakeCallback(&TcpGossipApp::ReceiveMessage, this));
+        }
+    
+        void SendMessage(std::string msg) {
+            if (m_messageManager.IsReceived(msg)) return;
+    
+            m_messageManager.MarkReceived(msg);
+            AddToPendingMessages(msg);
+        }
+    
+        void ReceiveMessage(Ptr<Socket> socket) {
+            Address from;
+            socket->GetPeerName(from);
+            
+            Ptr<Packet> packet = socket->Recv();
+            if (!packet || packet->GetSize() == 0) {
+                // Connection was closed or error
+                m_connectionPool.RemoveIncomingSocket(socket);
+                
+                // Try to find which neighbor this was
+                if (from.IsInvalid() == false) {
+                    try {
+                        Inet6SocketAddress inet6Addr = Inet6SocketAddress::ConvertFrom(from);
+                        Ipv6Address peerAddr = inet6Addr.GetIpv6();
+                        m_connectionPool.SetSocketActive(peerAddr, false);
+                    } catch (const std::exception& e) {
+                        // Address conversion failed, ignore
+                    }
+                }
+                
                 return;
             }
-        }
-    }
-
-    void PrintNeighbors() const {
-        std::cout << "Neighbors of " << m_myAddress << " (Node " << m_nodeId << "):" << std::endl;
-        for (const auto& neighbor : m_neighbors) {
-            std::cout << "  " << neighbor << std::endl;
-        }
-    }
-    
-    void StartApplication() override {
-        m_nodeId = GetNode()->GetId();
-        
-        // Only print neighbors for a small subset of nodes
-        if (m_nodeId % 50 == 0) {
-            PrintNeighbors();
-        }
-        
-        // Create listening socket
-        m_socket = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
-        m_socket->Bind(Inet6SocketAddress(Ipv6Address::GetAny(), 8080));
-        m_socket->Listen();
-
-        m_socket->SetAcceptCallback(
-            MakeCallback(&TcpGossipApp::AcceptConnection, this),
-            MakeCallback(&TcpGossipApp::HandleAccept, this)
-        );
-        
-        // Schedule connection establishment with delay based on node ID
-        // This staggers connection attempts to prevent network flood
-        Time delay = MilliSeconds(100 + (m_nodeId % 1000));
-        Simulator::Schedule(delay, &TcpGossipApp::EstablishConnections, this);
-        
-        // Schedule periodic connection check with staggered timing
-        m_connectionCheckEvent = Simulator::Schedule(
-            Seconds(2.0 + (double)(m_nodeId % 100) / 100.0), 
-            &TcpGossipApp::CheckConnections, this);
-    }
-    
-    void StopApplication() override {
-        // Cancel scheduled events
-        if (m_connectionCheckEvent.IsRunning()) {
-            Simulator::Cancel(m_connectionCheckEvent);
-        }
-        
-        if (m_forwardEvent.IsRunning()) {
-            Simulator::Cancel(m_forwardEvent);
-        }
-        
-        // Close all connections
-        m_connectionPool.CloseAllConnections();
-        
-        // Close listening socket
-        if (m_socket) {
-            m_socket->Close();
-            m_socket = nullptr;
-        }
-    }
-    
-    void EstablishConnections() {
-        // Let the connection pool manage connections
-        m_connectionPool.ManageConnections();
-        m_connectionsEstablished = true;
-    }
-    
-    void ConnectToNeighbor(Ipv6Address neighborAddr) {
-        // Create a new socket for this neighbor
-        Ptr<Socket> socket = Socket::CreateSocket(GetNode(), TcpSocketFactory::GetTypeId());
-        
-        socket->SetConnectCallback(
-            MakeCallback(&TcpGossipApp::ConnectionSucceeded, this),
-            MakeCallback(&TcpGossipApp::ConnectionFailed, this)
-        );
-        
-        socket->SetRecvCallback(MakeCallback(&TcpGossipApp::ReceiveMessage, this));
-        
-        // Add this socket to our tracking
-        m_connectionPool.SetSocket(neighborAddr, socket);
-        m_connectionPool.SetSocketActive(neighborAddr, false); // Not active yet
-        
-        // Try to connect
-        socket->Connect(Inet6SocketAddress(neighborAddr, 8080));
-    }
-    
-    void CheckConnections() {
-        // Manage connections periodically
-        m_connectionPool.ManageConnections();
-        
-        // Schedule next check with a random variation to prevent synchronization
-        double jitter = (double)(rand() % 500) / 1000.0; // 0-0.5s jitter
-        m_connectionCheckEvent = Simulator::Schedule(
-            Seconds(5.0 + jitter), 
-            &TcpGossipApp::CheckConnections, this);
-    }
-    
-    void SendHeartbeat(Ptr<Socket> socket) {
-        // Send a compact heartbeat message
-        std::string heartbeat = "h\n";
-        Ptr<Packet> packet = Create<Packet>((uint8_t*)heartbeat.c_str(), heartbeat.size());
-        socket->Send(packet);
-    }
-
-    bool AcceptConnection(Ptr<Socket> socket, const Address &from) {
-        return true;  
-    }
-
-    void HandleAccept(Ptr<Socket> socket, const Address &from) {
-        // Track this incoming socket
-        m_connectionPool.AddIncomingSocket(socket);
-        
-        // Set up receive callback
-        socket->SetRecvCallback(MakeCallback(&TcpGossipApp::ReceiveMessage, this));
-    }
-
-    void SendMessage(std::string msg) {
-        if (m_messageManager.IsReceived(msg)) return;
-
-        m_messageManager.MarkReceived(msg);
-        AddToPendingMessages(msg);
-    }
-
-    void ReceiveMessage(Ptr<Socket> socket) {
-        Address from;
-        socket->GetPeerName(from);
-        
-        Ptr<Packet> packet = socket->Recv();
-        if (!packet || packet->GetSize() == 0) {
-            // Connection was closed or error
-            m_connectionPool.RemoveIncomingSocket(socket);
             
-            // Try to find which neighbor this was
+            // Update activity on this connection
             if (from.IsInvalid() == false) {
                 try {
                     Inet6SocketAddress inet6Addr = Inet6SocketAddress::ConvertFrom(from);
                     Ipv6Address peerAddr = inet6Addr.GetIpv6();
-                    m_connectionPool.SetSocketActive(peerAddr, false);
+                    m_connectionPool.UpdateActivity(peerAddr);
+                    m_connectionPool.SetSocketActive(peerAddr, true);
                 } catch (const std::exception& e) {
                     // Address conversion failed, ignore
                 }
+            } else {
+                // Update based on the socket directly
+                m_connectionPool.UpdateActivityFromSocket(socket);
             }
+        
+            // Process the packet
+            uint32_t size = packet->GetSize();
+            std::vector<uint8_t> buffer(size);  
+            packet->CopyData(buffer.data(), size);
             
-            return;
+            // Process potentially multiple messages in the buffer
+            std::string data(buffer.begin(), buffer.end());
+            std::istringstream stream(data);
+            std::string line;
+            
+            // Parse each line as a separate message
+            while (std::getline(stream, line)) {
+                // Remove any carriage returns that might be present
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
+                
+                // Skip empty lines
+                if (line.empty()) continue;
+                
+                // Ignore heartbeat messages
+                if (line == "h") {
+                    continue;
+                }
+                
+                // Process the message if not received before
+                if (!m_messageManager.IsReceived(line)) {
+                    m_messageManager.MarkReceived(line);
+                    
+                    // Add to pending messages with a random delay
+                    AddToPendingMessages(line);
+                }
+            }
         }
         
-        // Update activity on this connection
-        if (from.IsInvalid() == false) {
+        void AddToPendingMessages(const std::string& msg) {
+            m_pendingMessages.push_back(msg);
+            
+            // If this is the first pending message, schedule forwarding
+            if (m_pendingMessages.size() == 1 && !m_forwardEvent.IsRunning()) {
+                // Schedule with random delay to prevent network congestion
+                Time delay = MilliSeconds(20 + (rand() % 200));
+                m_forwardEvent = Simulator::Schedule(delay, &TcpGossipApp::ForwardPendingMessages, this);
+            }
+            // If we've reached the batch size, forward immediately
+            else if (m_pendingMessages.size() >= MAX_PENDING_MESSAGES && !m_forwardEvent.IsRunning()) {
+                m_forwardEvent = Simulator::Schedule(FORWARD_INTERVAL, &TcpGossipApp::ForwardPendingMessages, this);
+            }
+        }
+        
+        void ForwardPendingMessages() {
+            if (m_pendingMessages.empty()) return;
+            
+            // Process all pending messages
+            for (const auto& msg : m_pendingMessages) {
+                if (!m_messageManager.IsForwarded(msg)) {
+                    ForwardMessage(msg);
+                    m_messageManager.MarkForwarded(msg);
+                }
+            }
+            
+            // Clear pending messages
+            m_pendingMessages.clear();
+        }
+        
+        void ForwardMessage(const std::string& msg) {
+            // Add newline character to delimit messages
+            std::string msgWithDelimiter = msg + "\n";
+    
+            // Get active neighbors in priority order
+            std::vector<Ipv6Address> priorityNeighbors;
+            for (const auto& neighbor : m_neighbors) {
+                if (m_connectionPool.IsActive(neighbor)) {
+                    priorityNeighbors.push_back(neighbor);
+                }
+            }
+            
+            // Random shuffle to distribute load
+            std::random_shuffle(priorityNeighbors.begin(), priorityNeighbors.end());
+            
+            // Forward to a subset of neighbors to reduce network load
+            // The larger the network, the smaller percentage we forward to
+            uint32_t forwardCount = std::max(3u, (uint32_t)(priorityNeighbors.size() * 0.5));
+            
+            for (uint32_t i = 0; i < std::min(forwardCount, (uint32_t)priorityNeighbors.size()); i++) {
+                Ipv6Address neighbor = priorityNeighbors[i];
+                Ptr<Socket> socket = m_connectionPool.GetSocket(neighbor);
+                
+                if (socket) {
+                    Ptr<Packet> packet = Create<Packet>((uint8_t*)msgWithDelimiter.c_str(), msgWithDelimiter.size());
+                    int bytes = socket->Send(packet);
+                    
+                    if (bytes <= 0) {
+                        m_connectionPool.SetSocketActive(neighbor, false);
+                    }
+                }
+            }
+        }
+    
+        void ConnectionSucceeded(Ptr<Socket> socket) {
+            Address from;
+            socket->GetPeerName(from);
+            
             try {
                 Inet6SocketAddress inet6Addr = Inet6SocketAddress::ConvertFrom(from);
                 Ipv6Address peerAddr = inet6Addr.GetIpv6();
-                m_connectionPool.UpdateActivity(peerAddr);
                 m_connectionPool.SetSocketActive(peerAddr, true);
             } catch (const std::exception& e) {
                 // Address conversion failed, ignore
             }
-        } else {
-            // Update based on the socket directly
-            m_connectionPool.UpdateActivityFromSocket(socket);
         }
     
-        // Process the packet
-        uint32_t size = packet->GetSize();
-        std::vector<uint8_t> buffer(size);  
-        packet->CopyData(buffer.data(), size);
-        
-        // Process potentially multiple messages in the buffer
-        std::string data(buffer.begin(), buffer.end());
-        std::istringstream stream(data);
-        std::string line;
-        
-        // Parse each line as a separate message
-        while (std::getline(stream, line)) {
-            // Remove any carriage returns that might be present
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
-            
-            // Skip empty lines
-            if (line.empty()) continue;
-            
-            // Ignore heartbeat messages
-            if (line == "h") {
-                continue;
-            }
-            
-            // Process the message if not received before
-            if (!m_messageManager.IsReceived(line)) {
-                m_messageManager.MarkReceived(line);
-                
-                // Add to pending messages with a random delay
-                AddToPendingMessages(line);
-            }
+        void ConnectionFailed(Ptr<Socket> socket) {
+            // Let the connection pool handle reconnection
+            // on its next management cycle
         }
-    }
     
-    void AddToPendingMessages(const std::string& msg) {
-        m_pendingMessages.push_back(msg);
-        
-        // If this is the first pending message, schedule forwarding
-        if (m_pendingMessages.size() == 1 && !m_forwardEvent.IsRunning()) {
-            // Schedule with random delay to prevent network congestion
-            Time delay = MilliSeconds(20 + (rand() % 200));
-            m_forwardEvent = Simulator::Schedule(delay, &TcpGossipApp::ForwardPendingMessages, this);
-        }
-        // If we've reached the batch size, forward immediately
-        else if (m_pendingMessages.size() >= MAX_PENDING_MESSAGES && !m_forwardEvent.IsRunning()) {
-            m_forwardEvent = Simulator::Schedule(FORWARD_INTERVAL, &TcpGossipApp::ForwardPendingMessages, this);
-        }
-    }
+        void SetSender() { m_isSender = true; }
     
-    void ForwardPendingMessages() {
-        if (m_pendingMessages.empty()) return;
-        
-        // Process all pending messages
-        for (const auto& msg : m_pendingMessages) {
-            if (!m_messageManager.IsForwarded(msg)) {
-                ForwardMessage(msg);
-                m_messageManager.MarkForwarded(msg);
-            }
+        uint32_t GetReceivedBlockCount() const {
+            return m_messageManager.GetReceivedBlockCount();
         }
         
-        // Clear pending messages
-        m_pendingMessages.clear();
-    }
+        uint32_t GetNodeId() const {
+            return m_nodeId;
+        }
+        
+        uint32_t GetConnectedNeighborCount() const {
+            return m_connectionPool.GetActiveConnectionCount();
+        }
+    };
     
-    void ForwardMessage(const std::string& msg) {
-        // Add newline character to delimit messages
-        std::string msgWithDelimiter = msg + "\n";
+    // Static member initialization
+    const Time TcpGossipApp::FORWARD_INTERVAL = MilliSeconds(100);// Static member initialization
 
-        // Get active neighbors in priority order
-        std::vector<Ipv6Address> priorityNeighbors;
-        for (const auto& neighbor : m_neighbors) {
-            if (m_connectionPool.IsActive(neighbor)) {
-                priorityNeighbors.push_back(neighbor);
-            }
-        }
-        
-        // Random shuffle to distribute load
-        std::random_shuffle(priorityNeighbors.begin(), priorityNeighbors.end());
-        
-        // Forward to a subset of neighbors to reduce network load
-        // The larger the network, the smaller percentage we forward to
-        uint32_t forwardCount = std::max(3u, (uint32_t)(priorityNeighbors.size() * 0.5));
-        
-        for (uint32_t i = 0; i < std::min(forwardCount, (uint32_t)priorityNeighbors.size()); i++) {
-            Ipv6Address neighbor = priorityNeighbors[i];
-            Ptr<Socket> socket = m_connectionPool.GetSocket(neighbor);
-            
-            if (socket) {
-                Ptr<Packet> packet = Create<Packet>((uint8_t*)msgWithDelimiter.c_str(), msgWithDelimiter.size());
-                int bytes = socket->Send(packet);
-                
-                if (bytes <= 0) {
-                    m_connectionPool.SetSocketActive(neighbor, false);
-                }
-            }
-        }
-    }
-
-    void ConnectionSucceeded(Ptr<Socket> socket) {
-        Address from;
-        socket->GetPeerName(from);
-        
-        try {
-            Inet6SocketAddress inet6Addr = Inet6SocketAddress::ConvertFrom(from);
-            Ipv6Address peerAddr = inet6Addr.GetIpv6();
-            m_connectionPool.SetSocketActive(peerAddr, true);
-        } catch (const std::exception& e) {
-            // Address conversion failed, ignore
-        }
-    }
-
-    void ConnectionFailed(Ptr<Socket> socket) {
-        // Let the connection pool handle reconnection
-        // on its next management cycle
-    }
-
-    void SetSender() { m_isSender = true; }
-
-    uint32_t GetReceivedBlockCount() const {
-        return m_messageManager.GetReceivedBlockCount();
-    }
-    
-    uint32_t GetNodeId() const {
-        return m_nodeId;
-    }
-    
-    uint32_t GetConnectedNeighborCount() const {
-        return m_connectionPool.GetActiveConnectionCount();
-    }
-};
-
-// Static member initialization
-const Time TcpGossipApp::FORWARD_INTERVAL = MilliSeconds(100);
 class MinerApp : public Application {
     private:
         EventId m_miningEvent;
@@ -772,17 +712,18 @@ class MinerApp : public Application {
     uint32_t MinerApp::totalBlocksMined = 0;
     std::map<uint32_t, uint32_t> MinerApp::perNodeMinedBlocks;
 // Efficient small-world network creation for large networks
+
 void CreateSmallWorldNetwork(std::vector<Ptr<TcpGossipApp>>& gossipApps, 
                             const Ipv6InterfaceContainer& interfaces,
                             uint32_t numNodes, uint32_t numPeers, 
-                            double rewireProbability = 0.1) {
+                            double rewireProbability = 0.5) {  // Changed default to 0.5 to match test
     std::cout << "Creating small-world network with " << numNodes << " nodes, " 
               << numPeers << " peers per node, and rewire probability " 
               << rewireProbability << std::endl;
-    
+
     // Create neighborhood data structures efficiently
     std::vector<std::unordered_set<uint32_t>> neighbors(numNodes);
-    
+
     // Step 1: Create a regular ring lattice
     for (uint32_t i = 0; i < numNodes; i++) {
         for (uint32_t j = 1; j <= numPeers / 2; j++) {
@@ -790,62 +731,75 @@ void CreateSmallWorldNetwork(std::vector<Ptr<TcpGossipApp>>& gossipApps,
             uint32_t clockwise = (i + j) % numNodes;
             // Connect to j nodes counter-clockwise
             uint32_t counterClockwise = (i - j + numNodes) % numNodes;
-            
+
             neighbors[i].insert(clockwise);
             neighbors[i].insert(counterClockwise);
         }
     }
-    
+
     // Step 2: Rewire some connections with probability p
     for (uint32_t i = 0; i < numNodes; i++) {
         std::vector<uint32_t> toRewire;
-        
+
         // Identify connections to potentially rewire
         for (uint32_t j = 1; j <= numPeers / 2; j++) {
             uint32_t clockwise = (i + j) % numNodes;
-            
+
             // With probability p, mark this connection for rewiring
             if ((double)rand() / RAND_MAX < rewireProbability) {
                 toRewire.push_back(clockwise);
             }
         }
-        
+
         // Perform rewiring for this node
         for (uint32_t target : toRewire) {
             // Remove the original connection
             neighbors[i].erase(target);
-            
+            neighbors[target].erase(i); // Remove the reverse connection too for symmetry
+
             // Find a new random node that's not already connected
             uint32_t attempts = 0;
             uint32_t randomNode;
             bool found = false;
-            
-            while (attempts < 10 && !found) { // Limit attempts to avoid infinite loops
+
+            while (attempts < 100 && !found) { // Increased attempts for better success rate
                 randomNode = rand() % numNodes;
-                
+
+                // Check it's not the same node and not already connected
                 if (randomNode != i && neighbors[i].find(randomNode) == neighbors[i].end()) {
                     found = true;
                 }
                 attempts++;
             }
-            
+
             if (found) {
+                // Add the new bidirectional connection
                 neighbors[i].insert(randomNode);
+                neighbors[randomNode].insert(i); // Add reverse connection too
             } else {
                 // If we couldn't find a suitable new neighbor, keep the original
                 neighbors[i].insert(target);
+                neighbors[target].insert(i); // Restore reverse connection too
             }
         }
     }
-    
+
     // Now convert the neighbor sets to actual network connections
     for (uint32_t i = 0; i < numNodes; i++) {
         for (uint32_t neighbor : neighbors[i]) {
             gossipApps[i]->AddNeighbor(interfaces.GetAddress(neighbor, 1));
         }
     }
+
+    // Calculate and display average node degree for verification
+    double avgDegree = 0.0;
+    for (uint32_t i = 0; i < numNodes; i++) {
+        avgDegree += neighbors[i].size();
+    }
+    avgDegree /= numNodes;
     
     std::cout << "Small-world network topology created successfully" << std::endl;
+    std::cout << "Average node degree: " << avgDegree << std::endl;
 }
 
 // Add this function before your main() function
@@ -978,9 +932,9 @@ int main(int argc, char* argv[]) {
     // Seed the random number generator with current time
     srand(time(nullptr));
     CommandLine cmd;
-    uint32_t numNodes = 1000;
+    uint32_t numNodes = 2000;
     uint32_t numPeers = 5;
-    double rewireProbability = 0.1;
+    double rewireProbability = 0.5;
     double simulationTime = 500.0;
 
     cmd.AddValue("numNodes", "Number of nodes in the network", numNodes);
